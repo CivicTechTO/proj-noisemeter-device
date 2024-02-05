@@ -23,6 +23,11 @@
 #include <dummy.h> // ESP32 core
 #include <driver/i2s.h> // ESP32 core
 
+#include <AsyncTCP.h>  //https://github.com/me-no-dev/AsyncTCP using the latest dev version from @me-no-dev
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>  //https://github.com/me-no-dev/ESPAsyncWebServer using the latest dev version from @me-no-dev
+#include <esp_wifi.h>           //Used for mpdu_rx_disable android workaround
+
 #include "board.h"
 #include "sos-iir-filter.h"
 #include "certs.h"
@@ -39,6 +44,13 @@ WiFiMulti WiFiMulti;
 
 constexpr auto AccessPointSSID = "Noise meter";
 constexpr auto AccessPointPsk = "noisemeter";
+#define MAX_CLIENTS 4   // ESP32 supports up to 10 but I have not tested it yet
+#define WIFI_CHANNEL 6  // 2.4ghz channel 6 https://en.wikipedia.org/wiki/List_of_WLAN_channels#2.4_GHz_(802.11b/g/n/ax)
+
+const IPAddress localIP(4, 3, 2, 1);           // the IP address the web server, Samsung requires the IP to be in public space
+const IPAddress gatewayIP(4, 3, 2, 1);         // IP address of the network should be the same as the local IP for captive portals
+const IPAddress subnetMask(255, 255, 255, 0);  // no need to change: https://avinetworks.com/glossary/subnet-mask/
+const String localIPURL = "http://4.3.2.1";  // a string version of the local IP with http, used for redirecting clients to your webpage
 const unsigned long UPLOAD_INTERVAL_MS = 60000 * 5;  // Upload every 5 mins
 // const unsigned long UPLOAD_INTERVAL_MS = 30000;  // Upload every 30 secs
 const String DEVICE_ID = "pcb-clyne";         // TODO EPROM
@@ -179,7 +191,7 @@ static void printCredentials(const String& ssid, const String& psk);
  * Saves credentials to EEPROM is form was properly submitted.
  * If successful, reboots the microcontroller.
  */
-static void saveNetworkCreds(WebServer& httpServer);
+static void saveNetworkCreds(AsyncWebServerRequest* request);
 
 /**
  * Returns true if the credentials stored in EEPROM are valid.
@@ -233,11 +245,13 @@ void setup() {
   initMicrophone();
 
 #ifndef UPLOAD_DISABLED
-  // Run the access point if it is requested or if there are no valid credentials.
-  if (isCredsResetPressed() || !isEEPROMCredsValid()) {
-    eraseNetworkCreds();
-    runAccessPoint();
-  }
+    if (isCredsResetPressed()) {
+      eraseNetworkCreds();
+    }
+    // Run the access point if it is requested or if there are no valid credentials.
+    if (!isEEPROMCredsValid()) {
+      runAccessPoint();
+    }
 
   // Valid credentials: Next step would be to connect to the network.
   const auto ssid = EEPROM.readString(EEPROMEntrySSID);
@@ -288,31 +302,134 @@ void loop() {
 }
 
 void runAccessPoint() {
-  static WebServer httpServer(80);
+  // static WebServer httpServer(80);
+  DNSServer dnsServer; // TODO this line errors: assert failed: tcpip_send_msg_wait_sem IDF/components/lwip/lwip/src/api/tcpip.c:455 (Invalid mbox)
+  AsyncWebServer server(80);
 
-  WiFi.mode(WIFI_AP);
-  WiFi.softAPConfig(AccessPointIP, AccessPointIP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AccessPointSSID, AccessPointPsk);
+// setUpDNSServer()
+// Define the DNS interval in milliseconds between processing DNS requests
+  const int DNS_INTERVAL = 30;
+  // Set the TTL for DNS response and start the DNS server
+  dnsServer.setTTL(3600);
+  dnsServer.start(53, "*", localIP);
 
-  // GET request means user wants to see the form.
-  // POST request means user has submitted data through the form.
-  httpServer.on("/", HTTP_GET,
-                [] {
-                  httpServer.send_P(200, PSTR("text/html"), SetupPageHTML);
-                });
-  httpServer.on("/", HTTP_POST,
-                [] {
-                  // Show "submitted" page immediately before we begin saving the credentials.
-                  httpServer.client().setNoDelay(true);
-                  httpServer.send_P(200, PSTR("text/html"), SubmitPageHTML);
-                  saveNetworkCreds(httpServer);
-                });
-  httpServer.begin();
+  // startSoftAccessPoint()
+  // Set the WiFi mode to access point and station
+  WiFi.mode(WIFI_MODE_AP);
+  SERIAL.println("X");
+  // WiFi.mode(WIFI_MODE_AP);
+
+  // Configure the soft access point with a specific IP and subnet mask
+  // WiFi.softAPConfig(AccessPointIP, AccessPointIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAPConfig(localIP, gatewayIP, subnetMask);
+  // Start the soft access point with the given ssid, password, channel, max number of clients
+  // WiFi.softAP(AccessPointSSID, AccessPointPsk);
+  WiFi.softAP(AccessPointSSID, AccessPointPsk, WIFI_CHANNEL, 0, MAX_CLIENTS);
+
+  // 	// Disable AMPDU RX on the ESP32 WiFi to fix a bug on Android
+  // esp_wifi_stop();
+  // esp_wifi_deinit();
+  // wifi_init_config_t my_config = WIFI_INIT_CONFIG_DEFAULT();
+  // my_config.ampdu_rx_enable = false;
+  // esp_wifi_init(&my_config);
+  // esp_wifi_start();
+  // vTaskDelay(100 / portTICK_PERIOD_MS);  // Add a small delay
+
+  // setUpWebserver()
+  //======================== Webserver ========================
+  // WARNING IOS (and maybe macos) WILL NOT POP UP IF IT CONTAINS THE WORD "Success" https://www.esp8266.com/viewtopic.php?f=34&t=4398
+  // SAFARI (IOS) IS STUPID, G-ZIPPED FILES CAN'T END IN .GZ https://github.com/homieiot/homie-esp8266/issues/476 this is fixed by the webserver serve static function.
+  // SAFARI (IOS) there is a 128KB limit to the size of the HTML. The HTML can reference external resources/images that bring the total over 128KB
+  // SAFARI (IOS) popup browser has some severe limitations (javascript disabled, cookies disabled)
+
+  // Required
+  server.on("/connecttest.txt", [](AsyncWebServerRequest* request) {
+    request->redirect("http://logout.net");
+  });  // windows 11 captive portal workaround
+  server.on("/wpad.dat", [](AsyncWebServerRequest* request) {
+    request->send(404);
+  });  // Honestly don't understand what this is but a 404 stops win 10 keep calling this repeatedly and panicking the esp32 :)
+
+  // Background responses: Probably not all are Required, but some are. Others might speed things up?
+  // A Tier (commonly used by modern systems)
+  server.on("/generate_204", [](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+  });  // android captive portal redirect
+  server.on("/redirect", [](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+  });  // microsoft redirect
+  server.on("/hotspot-detect.html", [](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+  });  // apple call home
+  server.on("/canonical.html", [](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+  });  // firefox captive portal call home
+  server.on("/success.txt", [](AsyncWebServerRequest* request) {
+    request->send(200);
+  });  // firefox captive portal call home
+  server.on("/ncsi.txt", [](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+  });  // windows call home
+
+  // B Tier (uncommon)
+  //  server.on("/chrome-variations/seed",[](AsyncWebServerRequest *request){request->send(200);}); //chrome captive portal call home
+  //  server.on("/service/update2/json",[](AsyncWebServerRequest *request){request->send(200);}); //firefox?
+  //  server.on("/chat",[](AsyncWebServerRequest *request){request->send(404);}); //No stop asking Whatsapp, there is no internet connection
+  //  server.on("/startpage",[](AsyncWebServerRequest *request){request->redirect(localIPURL);});
+
+  // return 404 to webpage icon
+  server.on("/favicon.ico", [](AsyncWebServerRequest* request) {
+    request->send(404);
+  });  // webpage icon
+
+  // GET "/" = Wifi Credentials page
+  // httpServer.on("/", HTTP_GET,
+  //               [](AsyncWebServerRequest *request) {
+  //                 httpServer.send_P(200, PSTR("text/html"), SetupPageHTML);
+  //               });
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    AsyncWebServerResponse* response = request->beginResponse(200, "text/html", SetupPageHTML);
+    response->addHeader("Cache-Control", "public,max-age=31536000");  // save this file to cache for 1 year (unless you refresh)
+    request->send(response);
+    SERIAL.println("Served Wifi Setup Page");
+  });
+
+  // GET "/" = Wifi Success page
+  // httpServer.on("/", HTTP_POST,
+  //               [](AsyncWebServerRequest *request) {
+  //                 // Show "submitted" page immediately before we begin saving the credentials.
+  //                 httpServer.client().setNoDelay(true);
+  //                 httpServer.send_P(200, PSTR("text/html"), SubmitPageHTML);
+  //                 saveNetworkCreds(httpServer);
+  //               });
+  server.on("/", HTTP_POST, [](AsyncWebServerRequest* request) {
+    AsyncWebServerResponse* response = request->beginResponse(200, "text/html", SubmitPageHTML);
+    response->addHeader("Cache-Control", "public,max-age=31536000");  // save this file to cache for 1 year (unless you refresh)
+    request->send(response);
+    SERIAL.println("Served Wifi Success Page");
+
+    saveNetworkCreds(request);
+  });
+
+  // the catch all
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    request->redirect(localIPURL);
+    SERIAL.print("onnotfound ");
+    SERIAL.print(request->host());  // This gives some insight into whatever was being requested on the serial monitor
+    SERIAL.print(" ");
+    SERIAL.print(request->url());
+    SERIAL.print(" sent redirect to " + localIPURL + "\n");
+  });
+
+  server.begin();
 
   SERIAL.println("Running setup access point.");
 
-  while (1)
-    httpServer.handleClient();
+  while (1) {
+    // server.handleClient();
+    dnsServer.processNextRequest();  // I call this atleast every 10ms in my other projects (can be higher but I haven't tested it for stability)
+    delay(DNS_INTERVAL);
+  }
 }
 
 void printCredentials(const String& ssid, const String& psk) {
@@ -370,31 +487,40 @@ bool isCredsResetPressed() {
   return pressed;
 }
 
-void saveNetworkCreds(WebServer& httpServer) {
+void saveNetworkCreds(AsyncWebServerRequest* request) {
   // Confirm that the form was actually submitted.
-  if (httpServer.hasArg("ssid") && httpServer.hasArg("psk")) {
-    const auto ssid = httpServer.arg("ssid");
-    const auto psk = httpServer.arg("psk");
+  String ssid;
+  String psk;
+  if (request->hasParam("ssid", true)) {
+    ssid = request->getParam("ssid", true)->value();
+  } else {
+    SERIAL.println("No arg for ssid");
+  }
+  if (request->hasParam("psk", true)) {
+    ssid = request->getParam("psk", true)->value();
+  } else {
+    SERIAL.println("No arg for psk");
+  }
 
-    // Confirm that the given credentials will fit in the allocated EEPROM space.
-    if (ssid.length() < EEPROMMaxStringSize && psk.length() < EEPROMMaxStringSize) {
-      EEPROM.writeUInt(EEPROMEntryCSum, calculateCredsChecksum(ssid, psk));
-      EEPROM.writeString(EEPROMEntrySSID, ssid);
-      EEPROM.writeString(EEPROMEntryPsk, psk);
-      EEPROM.commit();
+  // Confirm that the given credentials will fit in the allocated EEPROM space.
+  if (ssid.length() < EEPROMMaxStringSize && psk.length() < EEPROMMaxStringSize) {
+    EEPROM.writeUInt(EEPROMEntryCSum, calculateCredsChecksum(ssid, psk));
+    EEPROM.writeString(EEPROMEntrySSID, ssid);
+    EEPROM.writeString(EEPROMEntryPsk, psk);
+    EEPROM.commit();
 
-      SERIAL.print("Saving ");
-      printCredentials(ssid, psk);
+    SERIAL.print("Saving ");
+    printCredentials(ssid, psk);
 
-      SERIAL.println("Saved network credentials. Restarting...");
-      delay(2000);
-      ESP.restart();  // Software reset.
-    }
+    SERIAL.println("Saved network credentials. Restarting...");
+    delay(2000);
+    ESP.restart();  // Software reset.
   }
 
   // TODO inform user that something went wrong...
-  SERIAL.println("Error: Invalid network credentials!");
+  Serial.println("Error: Invalid network credentials!");
 }
+
 
 void eraseNetworkCreds() {
   SERIAL.println("Erasing stored credentials...");
@@ -535,6 +661,7 @@ void initMicrophone() {
   };
 
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  SERIAL.println(I2S_PORT);
   i2s_set_pin(I2S_PORT, &pin_config);
 
   // Discard first block, microphone may need time to startup and settle.
